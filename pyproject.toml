@@ -13,6 +13,7 @@ dependencies = [
     "tree-sitter>=0.21",
     "tree-sitter-language-pack>=1.0",
     "httpx>=0.27",
+    "anthropic>=0.40",
 ]
 
 [project.optional-dependencies]

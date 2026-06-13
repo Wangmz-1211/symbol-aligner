@@ -18,27 +18,24 @@ class MappingError(ValueError):
 def load_mapping(path: str | Path) -> dict[str, str]:
     """Read a mapping JSON file and return a flat ``{legacy: canonical}`` dict.
 
-    Raises :class:`MappingError` on duplicate legacy keys, duplicate canonical
-    values, empty fields, or structural problems.
+    Accepts a flat JSON object ``{"legacy": "canonical", ...}`` (preferred).
+
+    Raises :class:`MappingError` on duplicate canonical values, empty fields,
+    or structural problems.
     """
     with open(path, "rb") as f:
         raw = json.load(f)
 
-    entries = raw.get("mappings")
-    if not isinstance(entries, list):
-        raise MappingError("mapping file must contain a top-level 'mappings' array")
+    if not isinstance(raw, dict):
+        raise MappingError("mapping file must be a JSON object {legacy: canonical, ...}")
 
     result: dict[str, str] = {}
     seen_canonical: dict[str, str] = {}
-    for i, entry in enumerate(entries):
-        if not isinstance(entry, dict):
-            raise MappingError(f"mappings[{i}] is not an object")
-        legacy = entry.get("legacy")
-        canonical = entry.get("canonical")
+    for i, (legacy, canonical) in enumerate(raw.items()):
         if not isinstance(legacy, str) or not legacy:
-            raise MappingError(f"mappings[{i}].legacy must be a non-empty string")
+            raise MappingError(f"entry {i}: legacy key must be a non-empty string")
         if not isinstance(canonical, str) or not canonical:
-            raise MappingError(f"mappings[{i}].canonical must be a non-empty string")
+            raise MappingError(f"entry {i} ({legacy!r}): canonical must be a non-empty string")
         if legacy in result:
             raise MappingError(f"duplicate legacy key: {legacy!r}")
         if canonical in seen_canonical:

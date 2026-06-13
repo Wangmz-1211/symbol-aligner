@@ -317,9 +317,22 @@ python -m symbol_aligner.mcp_server   # またはインストール済みの sym
 ### テスト
 
 ```bash
-pytest                 # 全部。Ollama に接続できない場合に自動スキップされる live テストを 1 つ含む
+pytest                 # 全部。Ollama に接続できない場合に自動スキップされる live テストを含む
 pytest -m "not live"   # live テストをスキップ
 ```
+
+#### 正確率
+
+[tests/test_accuracy.py](./tests/test_accuracy.py) は生成したソースファイルを変換し、ground truth と比較します。テストケースは実際の工学的な略語慣習（母音省略・ドメイン頭字語：`computeRisk → compRsk`、`setAccount → setAcct`）を使います。
+
+| シナリオ | ケース数 | 正確率 |
+| --- | --- | --- |
+| clean——厳密な legacy key（自動適用パス） | 24 | **100%**（24/24） |
+| abbrev——ファジー top-1、LLM なし（`auto_apply=0`、`recall_min=0`） | 128 | **98.4%**（126/128） |
+| abbrev + LLM リコール——`claude-haiku-4-5` | 128 | **92.2%**（118/128） |
+| abbrev + LLM リコール——`llama3.1:8b` | 128 | **83.6%**（107/128） |
+
+ファジー層だけで略語ケースの 98.4% を処理します。LLM リコールは `[recall_min, auto_apply)` 帯に限定されたフォールバックで、レイテンシが増えるためデフォルトは無効です。128 ケースの LLM テストは `live` とマークされ、バックエンド未設定の場合は自動スキップされます。
 
 ### 既知の問題
 

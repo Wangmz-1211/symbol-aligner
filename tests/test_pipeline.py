@@ -69,17 +69,17 @@ def test_align_file_dry_run_does_not_write(tmp_path):
 
 def test_align_file_applies_when_not_dry_run(tmp_path):
     f = tmp_path / "m.py"
-    f.write_text("x = tmpVal\ny = calcTtl\n")
+    f.write_text("x = getUser\ny = setAccount\n")
     align_file(str(f), "mappings/example.json", dry_run=False)
     out = f.read_text()
-    assert "temporaryValue" in out
-    assert "calculateTotal" in out
+    assert "fetchClient" in out
+    assert "configurePortfolio" in out
 
 
 def test_report_dict_shape(tmp_path):
     f = tmp_path / "m.py"
-    f.write_text("x = tmpVal\n")
+    f.write_text("x = getUser\n")
     report = align_file(str(f), "mappings/example.json", dry_run=True)
     d = report.to_dict()
     assert d["summary"]["auto"] >= 1
-    assert any(ch["new"] == "temporaryValue" for ch in d["changes"])
+    assert any(ch["new"] == "fetchClient" for ch in d["changes"])

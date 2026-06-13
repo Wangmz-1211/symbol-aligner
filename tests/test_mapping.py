@@ -12,62 +12,31 @@ def write(tmp_path, obj):
 
 
 def test_load_valid_mapping(tmp_path):
-    m = load_mapping(
-        write(
-            tmp_path,
-            {
-                "version": 1,
-                "mappings": [
-                    {"legacy": "usr", "canonical": "user"},
-                    {"legacy": "acct", "canonical": "account"},
-                ],
-            },
-        )
-    )
-    assert m == {"usr": "user", "acct": "account"}
+    m = load_mapping(write(tmp_path, {"getUser": "fetchClient", "setAccount": "configurePortfolio"}))
+    assert m == {"getUser": "fetchClient", "setAccount": "configurePortfolio"}
 
 
 def test_loads_repo_example():
     m = load_mapping("mappings/example.json")
-    assert m["getUsrInf"] == "getUserInfo"
-
-
-def test_duplicate_legacy_rejected(tmp_path):
-    with pytest.raises(MappingError, match="duplicate legacy"):
-        load_mapping(
-            write(
-                tmp_path,
-                {"mappings": [
-                    {"legacy": "usr", "canonical": "user"},
-                    {"legacy": "usr", "canonical": "username"},
-                ]},
-            )
-        )
+    assert m["getUser"] == "fetchClient"
+    assert m["accountStatus"] == "ledgerState"
 
 
 def test_duplicate_canonical_rejected(tmp_path):
     with pytest.raises(MappingError, match="mapped from both"):
-        load_mapping(
-            write(
-                tmp_path,
-                {"mappings": [
-                    {"legacy": "usr", "canonical": "user"},
-                    {"legacy": "user", "canonical": "user"},
-                ]},
-            )
-        )
+        load_mapping(write(tmp_path, {"getUser": "fetchClient", "findUser": "fetchClient"}))
 
 
-def test_empty_fields_rejected(tmp_path):
+def test_empty_canonical_rejected(tmp_path):
     with pytest.raises(MappingError, match="non-empty"):
-        load_mapping(write(tmp_path, {"mappings": [{"legacy": "", "canonical": "user"}]}))
+        load_mapping(write(tmp_path, {"getUser": ""}))
 
 
-def test_missing_mappings_array_rejected(tmp_path):
-    with pytest.raises(MappingError, match="mappings"):
-        load_mapping(write(tmp_path, {"version": 1}))
+def test_non_dict_rejected(tmp_path):
+    with pytest.raises(MappingError, match="JSON object"):
+        load_mapping(write(tmp_path, [{"legacy": "getUser", "canonical": "fetchClient"}]))
 
 
 def test_empty_table_rejected(tmp_path):
     with pytest.raises(MappingError, match="empty"):
-        load_mapping(write(tmp_path, {"mappings": []}))
+        load_mapping(write(tmp_path, {}))

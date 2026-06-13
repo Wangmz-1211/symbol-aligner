@@ -21,8 +21,8 @@ def test_load_defaults_from_repo_config():
     assert cfg.top_k == 3
     assert cfg.thresholds.auto_apply == 0.99
     assert cfg.thresholds.recall_min == 0.45
-    assert cfg.llm.backend == "ollama"
-    assert cfg.llm.model == "llama3.1:8b"
+    assert cfg.llm.backend == "anthropic"
+    assert cfg.llm.model == "claude-haiku-4-5-20251001"
 
 
 def test_missing_keys_fall_back_to_defaults(tmp_path):

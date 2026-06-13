@@ -317,9 +317,22 @@ python -m symbol_aligner.mcp_server   # 或安装后的 symbol-aligner-mcp
 ### 测试
 
 ```bash
-pytest                 # 全部，含一个连不上 Ollama 时自动跳过的 live 用例
+pytest                 # 全部，含连不上 Ollama 时自动跳过的 live 用例
 pytest -m "not live"   # 跳过 live 用例
 ```
+
+#### 正确率
+
+[tests/test_accuracy.py](./tests/test_accuracy.py) 会变换一个生成的源文件，再与 ground truth 对比。测试用例采用真实工程中的缩写惯例（去元音、领域缩写：`computeRisk → compRsk`、`setAccount → setAcct`）。
+
+| 场景 | 案例数 | 正确率 |
+| --- | --- | --- |
+| clean——精确 legacy key（自动应用路径） | 24 | **100%**（24/24） |
+| abbrev——模糊 top-1，无 LLM（`auto_apply=0`，`recall_min=0`） | 128 | **98.4%**（126/128） |
+| abbrev + LLM 召回——`claude-haiku-4-5` | 128 | **92.2%**（118/128） |
+| abbrev + LLM 召回——`llama3.1:8b` | 128 | **83.6%**（107/128） |
+
+模糊层单独处理了 98.4% 的缩写案例；LLM 召回是限制在 `[recall_min, auto_apply)` 区间的兜底手段，会增加延迟，默认关闭。128 例 LLM 测试标为 `live`，未配置后端时自动跳过。
 
 ### 已知问题
 
