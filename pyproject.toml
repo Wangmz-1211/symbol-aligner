@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "symbol-aligner"
+version = "0.1.0"
+description = "Reliable, low-cost identifier renaming via AST + fuzzy matching, with LLM only as a fallback recall step."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "rapidfuzz>=3.0",
+    "tree-sitter>=0.21",
+    "tree-sitter-language-pack>=1.0",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+mcp = ["mcp>=1.0"]
+
+[project.scripts]
+symbol-aligner = "symbol_aligner.main:main"
+symbol-aligner-mcp = "symbol_aligner.mcp_server:main"
+
+[tool.setuptools]
+packages = ["symbol_aligner"]
+
+[tool.setuptools.package-dir]
+symbol_aligner = "src"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "live: tests that hit a live Ollama server (skipped if unreachable)",
+]
