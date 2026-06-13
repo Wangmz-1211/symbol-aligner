@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "mappings": [
+    { "legacy": "UsrAcctBal",       "canonical": "UserAccountBalance" },
+    { "legacy": "get_usr_acct_bal", "canonical": "get_user_account_balance" },
+    { "legacy": "usrAcctInfo",      "canonical": "userAccountInfo" },
+    { "legacy": "getUsrInf",        "canonical": "getUserInfo" },
+    { "legacy": "calcTtl",          "canonical": "calculateTotal" },
+    { "legacy": "tmpVal",           "canonical": "temporaryValue" }
+  ]
+}

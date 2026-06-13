@@ -1,81 +1,379 @@
-# SYMBOL-ALIGNER
+<!-- LANG-SWITCH -->
+**English** | [中文](./README.zh.md) | [日本語](./README.ja.md)
 
+# Symbol Aligner
 
+Reliable, low-cost identifier renaming for legacy code: AST locates identifiers, a
+weighted blend of fuzzy-matching algorithms does the high-confidence conversions, and an
+LLM is used **only** as a last-resort recall step. Most of the work is done by
+deterministic algorithms, which keeps it cheap and auditable.
 
-### 该项目诞生的契机
+## Introduction
 
-在一个遗留项目的重构过程中，出现了一个比较尴尬的情况：重构伴随着业务命名规范的变更，因此需要对大量代码进行重命名。由于项目中存在大量非规范命名的代码，直接全文替换会导致大量的误替换或者漏替换，而手动修改不仅非常消耗时间，而且工作质量难以保证。
+See the [story](./STORY.md) for the background and motivation behind this project.
 
-首先，我要说明这个问题为什么有难度，又为什么很重要。
+## Design
 
-命名重构本身具有以下特点：
+### Overall idea
 
-1.   文本绝大多数为复合词，并且通常是由几种简单的文本映射组成（后文将称之为子映射）；
-2.   子映射并非能够作用于所有的复合词上。两种子映射构成的复合映射并非简单的拼接，而是可能会使其中一种子映射失效，且并无规律可言（这取决于业务的设计，并非技术团队的本意）；
-3.   由于早期开发人员的坏习惯，代码中存在不标准的命名，但是与标注命名具有较高相似度，如省略了元音或拼写错误。
+The core principle of the pipeline: **AST handles precise location, fuzzy matching handles
+high-confidence automatic conversion, and the LLM is only the last-resort recall step when
+fuzzy matching cannot decide.** The vast majority of the work is done by deterministic,
+traditional algorithms, in order to control cost and guarantee auditability.
 
-此外，项目代码存在着架构设计混乱、模块间耦合性强的问题，这大大提高了命名重构的难度：当变量名的作用域超过了单文件的范围，不可靠的转换将在项目中引入更多的编译错误。文件之间不同步的转换将影响索引的创建，LSP往往将转换前/后的变量视为独立的项目，从而破坏了上下文的完整性。
+```
+┌─────────────────────────────────────────────┐
+│                 MCP tool layer                │
+│   align_file | align_batch | preview | query │
+└──────────────────────┬──────────────────────┘
+                      │  main.py (pipeline orchestration)
+       ┌───────────────┼───────────────┐
+       ▼               ▼               ▼
+ ast_analyze.py   fuzz_match.py     recall.py
+ (tree-sitter)    (rapidfuzz)       (LLM, fallback)
+   locate ids      top-k scoring     pick on low confidence
+       └───────────────┴───────────────┘
+                      │
+                 mapping.json
+              (1-to-1 mapping table)
+```
 
-因此，在大规模着手代码转换工作之前有必要首先找到一个高可靠性的方法来解决命名转换的问题，否则会对后续的工作造成难以估计的负面影响。
+### Data structures
 
-#### 团队中的早期方案
+#### Mapping table `mapping.json`
 
-在项目的早期阶段，团队成员提出了很多种解决方案，但是经实践证明，这些方案要么效率低下，要么无法满足准确性要求。在介绍本仓库的设计之前，有必要首先回顾一下本人认为效率非常低下的这些早期方案，并且对其不合理之处进行分析。
+The mapping is strictly **1-to-1**: `legacy` (used to match the legacy field) → `canonical`
+(the standardized new field).
 
-##### 方案一
+```json
+{
+  "version": 1,
+  "mappings": [
+    { "legacy": "UsrAcctBal",       "canonical": "UserAccountBalance" },
+    { "legacy": "get_usr_acct_bal", "canonical": "get_user_account_balance" },
+    { "legacy": "usrAcctInfo",      "canonical": "userAccountInfo" }
+  ]
+}
+```
 
-最早的方案在我进入项目之前就已经被提出了。
+It is flattened into a `dict[str, str]` (`legacy → canonical`) for matching. Both
+directions must be unique: a legacy key cannot map to two canonicals, and two legacy keys
+cannot map to the same canonical.
 
-该方法基于简单映射关系与黑名单机制，即穷举了所有可能存在的子映射项目，以及及时存在子映射项目也禁止转换的项目，作为提示词的一部分提供给 Agent ，Agent 在独立的 Session 中负责处理单个文件。这个方案伴随着几个提示词文件，过程分为了两个步骤：
+#### Identifier candidate `IdentifierCandidate`
 
-1.   由人工提供提前准备好的提示词文件和目标文件，使 Agent 根据指令在文件中检索和分析，所有需要命名重构的位置，并用一种提前定义的格式整理为 Markdown 表格。对于其中置信度比较低的映射，则需要人工查询单一可信的信息源，即一个共享的表格文件，并用一种提前定义好的方式来回复 Agent。
-2.   在步骤一中通过回复使 Agent 明确映射关系后，提供另一个预先准备好的提示词，使 Agent 按照预先定义好的流程进行修改，并最终按照预先定义好的格式进行输出。
+```python
+@dataclass
+class IdentifierCandidate:
+    text: str                # original text
+    id_type: IdentifierType  # VARIABLE / FUNCTION / CLASS / STRING / IMPORT
+    file_path: str
+    line: int                # 1-based
+    col_start: int
+    col_end: int
+    start_byte: int          # absolute byte offset — the basis for replacement
+    end_byte: int
+    context: str             # surrounding lines, for LLM recall
+    scope: str               # scope path, e.g. "MyClass.my_method"
+```
 
-相信读到上述的方案时，各位一定是眼前一黑，甚至于无力吐槽。
+#### Match result `MatchResult`
 
-1.   很显然，整个流程都是固定的：固定的子映射、固定的工作流以及固定的输出格式。然而这个行为并没有沉淀为一个可复用的 Skill；
-2.   提出方案的人们并非没有意识到最初介绍的命名转换特性之二，即复合词的映射并非子映射的简单叠加——他们在工作流中加入了人工审核的过程。然而依然选择了暂时性地忽视这个问题，将技术债转化成了人工成本；
-3.   该方案没有考虑到计算成本——这在2026年6月之前的 Github Copilot 计费标准下不是个大问题，但在目前的标准下算力消耗是个不得不考虑的问题；
+```python
+@dataclass
+class MatchResult:
+    candidate: IdentifierCandidate
+    matched_key: str | None   # the legacy key that was hit
+    replacement: str | None   # the corresponding canonical
+    confidence: float         # 0.0 .. 1.0
+    source: MatchSource       # EXACT / FUZZY / LLM / NONE
+    reason: str               # for the audit log
+```
 
-该方案没有考虑到 Agent 并非是一种具有稳定映射的工具，而是在概率模型之上搭建出来的一种具有智能的产物——因此才被称为 AI Agent。最终，实践证明了这个方案是个彻头彻尾的失败，并且经过这种方法转换而来的文件都为后续的转换和测试环节留下了很大的隐患
+### Matching flow
 
-##### 方案二
+```
+query identifier
+    │
+    ▼
+score against every legacy key in the mapping
+    │
+    ▼
+take the top-k candidates (k defaults to 3)
+    │
+    ▼
+grade by the top-1 score → auto-apply / LLM recall / discard
+```
 
-随着方案一的流产，另一个团队提出了一个新方案——也许是受 MAS 设计和 AI Harness 思想的影响，他们开发了一个 Skill 来处理这个命名转换的问题。他们设计了一个复杂的 MAS，用一个 Orchestrator 来进行全局的调度，并设计了多种角色来完成一个较长的工作流，我记得至少有五个阶段，每个阶段又可能有几种变体，为了提高可审计性，用报告管理对应阶段的产出。
+Candidates are determined by the top-k of "similarity between every mapping and the current
+query", with no tokenization. The only exception is **string literals (`STRING`)**: they
+are first `split` on whitespace/punctuation, each token runs top-k separately, and the
+results are merged. Every other kind is matched whole.
 
-最终，这个方案体现出了几种特点：
+### Module design
 
-1.   方案过度依赖于 Agent 的推理能力，因此不能保证命名转换的质量；
-2.   因流程过长，微小误差在流程中可能积累成较大的错误；
-3.   又因流程过长，对算力的消耗非常高。这在当前的 Github Copilot 计费方式下成为了经费黑洞；
-4.   又因流程过长，即使每一个阶段都会输出一份报告，但是这不表明在遇到问题的时候能够快速锁定错误，从而对这个流程本身有迭代优化的作用；
-5.   又因流程过长，执行耗时太长，效率低下。
+#### `ast_analyze.py` — AST analysis
 
-综上所述，两种方案之间承上启下，具有一个相同的核心思想——直接把工作交给 Agent，它什么都能做。其中方案二相对于方案一有了很大的改善，利用了 MAS 的方式进行了上下文的管理，聚焦于可审计，以及可控可复用的流程设计。然而它却犯了个非常基础的问题，忽略了误差的放大效应，设计出了即使是人都难以理解的复杂流程。
+Parses source with [tree-sitter](https://github.com/tree-sitter/tree-sitter) and extracts
+identifier candidates by kind. The `id_type` decides whether splitting is needed later:
 
-#### 本方案
+| Identifier kind | tree-sitter node | Handling |
+| --- | --- | --- |
+| `VARIABLE` | `identifier` in assignments/declarations | matched whole |
+| `FUNCTION` | `function_definition.name` | matched whole |
+| `CLASS`    | `class_definition.name` | matched whole |
+| `IMPORT`   | identifiers inside `import_statement` / `import_from_statement` | matched whole |
+| `STRING`   | `string_content` node | split into words, then matched per token |
 
-个人认为，随着近几个月 LLM 能力的快速提高，很多工程师对 Agent 能力边界有一些并不准确的认知（包括我自己）。对于复杂的问题，Agent 可能会提出各种各样的解决方案，但是没人来保证这些解决方案是否可靠、是否高效以及是否可行。因此，在进行相关应用的开发时，时刻记住 AI 并不可靠是一个基本方向。
+Replacement is done by AST node byte offsets (not regex find-and-replace), which
+fundamentally eliminates wrong replacements and positional drift. Languages are described
+by a small `LanguageSpec`; **Python is registered first**, and adding a language only
+requires adding a new spec.
 
-此外，很多人似乎仅能接触到比较高级的 Agent，而对底层的 LLM 并不熟悉。对于一些简单问题，也许在 CPU 上部署 7b 参数量的模型足以解决其中的关键，而剩下的部分都可以写成脚本，但是很多人只能想到使用 Agent 来处理整个复杂的问题。他们努力的方向在最开始就错了。
+#### `fuzz_match.py` — fuzzy matching
 
-对于该项目中存在的几种主要问题，在本项目中是这样处理的：
+Uses [RapidFuzz](https://github.com/rapidfuzz/RapidFuzz) with a multi-algorithm weighted
+score, covering spelling errors, dropped vowels, abbreviations, and other non-standard
+naming. An exact match short-circuits to `1.0`.
 
-| 问题                         | 解决方案                                        |
-| ---------------------------- | ----------------------------------------------- |
-| 子映射的非线性叠加           | 复合映射是有限的集合，有必要维护完整的映射集合  |
-| 非标准的命名                 | 采用了多种模糊匹配算法的加权，覆盖多种错误      |
-| 减少人工审核                 | 使用 LLM 对判断匹配结果，只匹配映射集合内的结果 |
-| 关键词可能嵌入在不同标识符中 | 使用AST解析，不同的标识符用不同方式匹配         |
+```python
+def score(query, key, weights) -> float:
+    if query == key:
+        return 1.0
+    return (
+        weights.ratio            * fuzz.ratio(query, key)             # Levenshtein: typos
+        + weights.partial_ratio    * fuzz.partial_ratio(query, key)   # substring: abbreviations
+        + weights.token_sort_ratio * fuzz.token_sort_ratio(query, key)  # order-insensitive
+        + weights.jaro_winkler     * (JaroWinkler.similarity(query, key) * 100.0)  # prefix weighting
+    ) / 100.0
 
-对于前文提到的两种方案的一些其他不足之处，在本方法中是这样解决的：
+def get_top_k(query, mapping, weights, k=3) -> list[tuple[str, float]]:
+    scored = [(key, score(query, key, weights)) for key in mapping]
+    scored.sort(key=lambda kv: (-kv[1], kv[0]))  # ties broken by key, so output is stable
+    return scored[:k]
+```
 
-1.   可复用性：本方法通过脚本实现，暴露为MCP tool；
-2.   计算成本：本方法仅使用 LLM，理论上成本仅为 Agent 的几十（或上百）分之一；
-3.   对 Agent 推理的过度依赖：本方法绝大部分为传统的匹配算法，仅在模糊匹配时的语义分析召回时用到了 LLM；
-4.   可审计性：命名替换是基于脚本和AST的，审计数据的准备比较简单可靠。
+#### `recall.py` — LLM recall (fallback)
 
-下一阶段，将介绍详细的设计。
+**Triggered only when the top-1 score lands in the recall band**; it is the one and only
+place in the whole pipeline that calls the LLM. The top-k candidates and the context are
+handed to the LLM, which **chooses** among the offered set (it does not invent a
+replacement); the output is tightly constrained JSON, so token usage is minimal. Results
+for the same `(text, context, candidate keys)` are cached.
 
----
+```
+You are a code symbol mapping assistant.
+The identifier below is a non-standard (legacy) name that may correspond to one of the
+candidate mappings. Decide which candidate, if any, the identifier is a misspelling/
+abbreviation of, using the surrounding context.
 
+Return ONLY a JSON object. "key" MUST be copied verbatim from the left-hand "legacy"
+column of one candidate line below:
+  {"key": "<exact legacy token>", "confidence": <0.0-1.0>}
+If none fits, return {"key": null, "confidence": 0.0}
+
+Identifier: {text}
+Type: {id_type}
+Context:
+{context}
+
+Candidates (legacy -> canonical):
+{candidates}
+```
+
+> In practice `llama3.1:8b` often returns the `canonical` (right-hand side) instead of the
+> `legacy` key. Because the mapping is 1-to-1, the recall module accepts either side, while
+> still staying strictly within the offered candidate set — balancing robustness and
+> auditability. An out-of-set answer is treated as a rejection.
+
+#### `llm.py` — LLM client abstraction
+
+Wraps a minimal `complete(prompt)` interface. The default backend talks to a local
+**Ollama** server; other backends can implement the same protocol.
+
+### Confidence grading
+
+No threshold is hard-coded in the source — they all come from the config file. There is
+**no human-review tier**:
+
+| top-1 score | Handling |
+| --- | --- |
+| ≥ `thresholds.auto_apply` (0.99) | auto-apply top-1 |
+| ≥ `thresholds.recall_min` (0.45) | hand the top-k to the LLM for recall |
+| < `thresholds.recall_min` | discard |
+
+When no LLM recaller is supplied, candidates in the recall band are simply discarded.
+
+#### Config file `config.toml`
+
+```toml
+[matching]
+top_k = 3
+
+[thresholds]
+auto_apply = 0.99   # apply directly, no LLM
+recall_min = 0.45   # below this -> discard
+
+[llm]
+backend    = "ollama"
+base_url   = "http://localhost:11434"
+model      = "llama3.1:8b"
+max_tokens = 64
+timeout    = 30.0
+cache      = true
+
+[scoring.weights]
+ratio            = 0.40
+partial_ratio    = 0.25
+token_sort_ratio = 0.20
+jaro_winkler     = 0.15
+```
+
+### MCP tool interface
+
+```
+align_single_file(file_path, mapping_path, config_path?, use_llm?)  # align one file, return change report
+align_batch(directory, mapping_path, extensions?, config_path?, dry_run?, use_llm?)  # process a directory
+preview_alignment(file_path, mapping_path, config_path?, use_llm?)  # dry-run, preview only
+query_candidates(identifier, mapping_path, config_path?)            # debug: top-k for one identifier
+```
+
+### Audit report
+
+```json
+{
+  "file": "src/service/usrAcctService.ts",
+  "summary": { "auto": 42, "llm": 5, "discarded": 3 },
+  "changes": [
+    { "line": 12, "old": "usrAcctBal", "new": "userAccountBalance",
+      "confidence": 0.997, "source": "FUZZY" },
+    { "line": 34, "old": "getUsrInf", "new": "getUserInfo",
+      "confidence": 0.81, "source": "LLM",
+      "reason": "LLM selected 'getUsrInf' from top-3 (conf 0.81)" }
+  ]
+}
+```
+
+### Directory layout
+
+```
+symbol-aligner/
+├── src/                    # importable as the `symbol_aligner` package
+│   ├── main.py             # pipeline orchestration + CLI
+│   ├── ast_analyze.py      # ASTAnalyzer: tree-sitter parsing & location
+│   ├── fuzz_match.py       # get_top_k / score: fuzzy scoring
+│   ├── recall.py           # LLMRecall: low-confidence recall
+│   ├── llm.py              # LLMClient abstraction (Ollama backend)
+│   ├── models.py           # IdentifierCandidate / MatchResult / AlignmentReport
+│   ├── mapping.py          # mapping table loading & validation
+│   ├── config.py           # config.toml loading
+│   └── mcp_server.py       # FastMCP server exposing the four tools
+├── mappings/example.json
+├── config.toml
+├── tests/
+└── README.md
+```
+
+## Implementation Plan
+
+The implementation is staged so that each stage is independently testable, starting from
+the core algorithms that need no external service and bringing in the LLM and MCP last.
+
+1. **Base data layer** — `models.py` (data classes & enums), `config.py` (parse
+   `config.toml`), `mapping.py` (load & validate the 1-to-1 table). No external deps;
+   unit tests first.
+2. **Fuzzy-matching core** — `fuzz_match.py`: the weighted `score` and `get_top_k`.
+   Validate ranking and threshold boundaries with a set of "legacy → canonical" samples;
+   this is the most critical part and needs the most test coverage.
+3. **AST analysis** — `ast_analyze.py`: integrate tree-sitter, support a single language
+   (Python) first, extract `IdentifierCandidate`s and node coordinates. Validate
+   extraction and location with fixture sources.
+4. **Pipeline (no LLM)** — `main.py`: wire parse → top-k → threshold grading →
+   offset-based replacement; handle only the `auto_apply` and `discard` tiers first, and
+   emit the audit report. High-confidence auto-conversion of real files already works here.
+5. **LLM recall** — `llm.py` + `recall.py`: fill in the recall logic for the
+   `[recall_min, auto_apply)` band, with result caching. Test the LLM part with a mock
+   client so tests do not depend on the network.
+6. **String handling** — add the `STRING` split branch to the pipeline.
+7. **MCP wrapping** — expose `align_single_file` / `align_batch` / `preview_alignment` /
+   `query_candidates`, plus the dry-run preview.
+8. **Polish** — `pyproject.toml`, example mapping, end-to-end tests, README usage.
+
+> All eight stages are implemented. The code is under [src/](./src), and the tests are
+> under [tests/](./tests).
+
+## Usage
+
+### Install
+
+The project targets **Python 3.13** (tree-sitter's C extension has an ABI issue on 3.14;
+see Known issues below).
+
+```bash
+python3.13 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev,mcp]"
+```
+
+Dependencies: `rapidfuzz`, `tree-sitter` + `tree-sitter-language-pack`, `httpx`; optional
+`mcp`, `pytest`.
+
+### Command line
+
+```bash
+# Preview (dry-run, no writes), prints a JSON audit report
+python -m symbol_aligner.main path/to/file.py mappings/example.json
+
+# Actually write
+python -m symbol_aligner.main path/to/file.py mappings/example.json --apply
+
+# Enable LLM recall (handles near-misses in the [recall_min, auto_apply) band)
+python -m symbol_aligner.main path/to/file.py mappings/example.json --apply --use-llm
+```
+
+After install, the `symbol-aligner` console command is also available.
+
+### LLM backend
+
+Recall uses a local [Ollama](https://ollama.com/) server, default model `llama3.1:8b`,
+configured under `[llm]` in `config.toml`:
+
+```bash
+ollama pull llama3.1:8b   # one-time
+ollama serve              # listens on http://localhost:11434 by default
+```
+
+Without `--use-llm`, the LLM is never touched and recall-band candidates are discarded.
+
+### MCP server
+
+```bash
+python -m symbol_aligner.mcp_server   # or the installed symbol-aligner-mcp
+```
+
+Exposes four tools: `align_single_file`, `preview_alignment`, `align_batch`,
+`query_candidates`.
+
+### Config `config.toml`
+
+All thresholds and scoring weights live here; nothing is hard-coded. Key items:
+`thresholds.auto_apply` (default 0.99, apply directly), `thresholds.recall_min` (default
+0.45, discard below it), `matching.top_k` (default 3), `scoring.weights` (four algorithm
+weights, must sum to 1).
+
+### Testing
+
+```bash
+pytest                 # everything, including one live test that auto-skips if Ollama is unreachable
+pytest -m "not live"   # skip the live test
+```
+
+### Known issues
+
+- **Python 3.14**: `tree-sitter` 0.25.2's C extension behaves incorrectly on 3.14
+  (descriptor access is scrambled — `tree.root_node` returns a method object), so the
+  project pins 3.13.
+- **`tree_sitter_language_pack.get_parser()`** returns a broken parser on the current
+  version combination; the code constructs `Parser(get_language(...))` directly instead.
+- AST analysis currently registers **Python** only; adding a language only requires a new
+  `LanguageSpec` in [src/ast_analyze.py](./src/ast_analyze.py).
