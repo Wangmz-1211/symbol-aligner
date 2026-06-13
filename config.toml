@@ -11,9 +11,9 @@ recall_min = 0.45   # top-1 score in [recall_min, auto_apply) -> ask the LLM
 
 [llm]
 # Local Ollama deployment.
-backend    = "ollama"
-base_url   = "http://localhost:11434"
-model      = "llama3.1:8b"
+backend    = "anthropic"
+base_url   = "https://api.anthropic.com"
+model      = "claude-haiku-4-5-20251001"
 max_tokens = 64
 timeout    = 30.0
 cache      = true

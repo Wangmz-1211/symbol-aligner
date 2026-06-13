@@ -364,9 +364,26 @@ weights, must sum to 1).
 ### Testing
 
 ```bash
-pytest                 # everything, including one live test that auto-skips if Ollama is unreachable
-pytest -m "not live"   # skip the live test
+pytest                 # everything, including live tests that auto-skip if Ollama is unreachable
+pytest -m "not live"   # skip the live tests
 ```
+
+#### Accuracy
+
+[tests/test_accuracy.py](./tests/test_accuracy.py) transforms a generated source file and
+compares the result against ground truth. Test cases use real-world abbreviation conventions
+(dropping vowels, domain acronyms: `computeRisk → compRsk`, `setAccount → setAcct`).
+
+| Scenario | Cases | Accuracy |
+| --- | --- | --- |
+| clean — exact legacy keys (auto-apply path) | 24 | **100%** (24/24) |
+| abbrev — fuzzy top-1, no LLM (`auto_apply=0`, `recall_min=0`) | 128 | **98.4%** (126/128) |
+| abbrev + LLM recall — `claude-haiku-4-5` | 128 | **92.2%** (118/128) |
+| abbrev + LLM recall — `llama3.1:8b` | 128 | **83.6%** (107/128) |
+
+The fuzzy layer alone handles 98.4% of abbreviation cases; LLM recall is a fallback confined
+to the `[recall_min, auto_apply)` band and adds latency, so it is off by default. The
+128-case LLM run is marked `live` and skipped unless a backend is configured.
 
 ### Known issues
 

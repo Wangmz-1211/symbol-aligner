@@ -16,21 +16,23 @@ from .llm import LLMClient
 from .models import IdentifierCandidate, MatchResult, MatchSource
 
 _PROMPT = """You are a code symbol mapping assistant.
-The identifier below is a non-standard (legacy) name that may correspond to one
-of the candidate mappings. Decide which candidate, if any, the identifier is a
-misspelling/abbreviation of, using the surrounding context.
+Match the identifier to the single best candidate. Engineers abbreviate by
+dropping vowels and truncating words, e.g. "fndMkt" is "findMarket",
+"lstRsk" is "listRisk", "rcvAst" is "receiveAsset". Always pick the closest
+match; only return null if the identifier is completely unrelated to every
+candidate.
 
-Return ONLY a JSON object. "key" MUST be copied verbatim from the left-hand
-"legacy" column of one candidate line below:
-  {{"key": "<exact legacy token>", "confidence": <0.0-1.0>}}
-If none fits, return {{"key": null, "confidence": 0.0}}
+Return ONLY a JSON object:
+  {{"key": "<legacy token copied verbatim>", "confidence": <0.0-1.0>}}
+or {{"key": null, "confidence": 0.0}} if truly no candidate fits.
+"key" must be ONLY the token name on the left of "->", nothing else.
 
 Identifier: {text}
 Type: {id_type}
 Context:
 {context}
 
-Candidates (legacy -> canonical):
+Candidates (legacy_token -> canonical):
 {candidates}
 """
 

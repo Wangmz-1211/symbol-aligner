@@ -7,6 +7,7 @@ backends can implement the same :class:`LLMClient` protocol.
 
 from __future__ import annotations
 
+import os
 from typing import Protocol
 
 import httpx
@@ -43,8 +44,32 @@ class OllamaClient:
         return resp.json().get("response", "")
 
 
+class AnthropicClient:
+    """Calls the Anthropic Messages API. API key is read from CLAUDE_API_KEY env var."""
+
+    def __init__(self, config: LLMConfig):
+        import anthropic
+
+        api_key = os.environ.get("CLAUDE_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
+        if not api_key:
+            raise ValueError("CLAUDE_API_KEY environment variable is not set")
+        self._client = anthropic.Anthropic(api_key=api_key)
+        self.config = config
+
+    def complete(self, prompt: str) -> str:
+        msg = self._client.messages.create(
+            model=self.config.model,
+            max_tokens=self.config.max_tokens,
+            temperature=0.0,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return msg.content[0].text if msg.content else ""
+
+
 def build_client(config: LLMConfig) -> LLMClient:
     """Instantiate the configured backend."""
     if config.backend == "ollama":
         return OllamaClient(config)
+    if config.backend == "anthropic":
+        return AnthropicClient(config)
     raise ValueError(f"unsupported LLM backend: {config.backend!r}")
