@@ -129,41 +129,67 @@ def score(query, key, weights) -> float:
         + weights.jaro_winkler     * (JaroWinkler.similarity(query, key) * 100.0)  # 前缀加权
     ) / 100.0
 
-def get_top_k(query, mapping, weights, k=3) -> list[tuple[str, float]]:
-    scored = [(key, score(query, key, weights)) for key in mapping]
-    scored.sort(key=lambda kv: (-kv[1], kv[0]))  # 同分按 key 排序，输出稳定
+def score_detail(query, key, weights) -> dict:
+    """返回四种分量得分与最终加权得分，均在 [0, 1] 范围内。"""
+    if query == key:
+        return {"ratio": 1.0, "partial_ratio": 1.0,
+                "token_sort_ratio": 1.0, "jaro_winkler": 1.0, "weighted": 1.0}
+    ratio      = fuzz.ratio(query, key) / 100.0
+    partial    = fuzz.partial_ratio(query, key) / 100.0
+    token_sort = fuzz.token_sort_ratio(query, key) / 100.0
+    jw         = JaroWinkler.similarity(query, key)
+    weighted   = (weights.ratio * ratio + weights.partial_ratio * partial
+                  + weights.token_sort_ratio * token_sort + weights.jaro_winkler * jw)
+    return {"ratio": ratio, "partial_ratio": partial,
+            "token_sort_ratio": token_sort, "jaro_winkler": jw, "weighted": weighted}
+
+def get_top_k(query, mapping, weights, k=3) -> list[tuple[str, dict]]:
+    """返回最多 k 个 (legacy_key, score_detail) 对，加权得分从高到低排列。"""
+    scored = [(key, score_detail(query, key, weights)) for key in mapping]
+    scored.sort(key=lambda kv: (-kv[1]["weighted"], kv[0]))
     return scored[:k]
 ```
 
 #### `recall.py` — LLM 召回（fallback）
 
-**仅当 top-1 得分落在召回区间时触发**，是全流程唯一调用 LLM 的环节。把 TopK 候选与上下文交给 LLM，让其从候选集中**选择**（不让它凭空生成替换），输出严格受限的 JSON，token 消耗极小。相同 `(text, context, 候选 keys)` 的结果会被缓存。
+**仅当 top-1 得分落在召回区间时触发**，是全流程唯一调用 LLM 的环节。把 top-k 候选（含各算法分量得分的完整明细）以 JSON 数组形式交给 LLM，让其从候选集中**选择**（不允许凭空生成替换），输出严格受限的 JSON 对象，token 消耗极小。相同 `(text, 候选 keys)` 的结果会被缓存。
+
+每次调用都会记录在 `LLMRecall.audit_log` 中，包含完整链路：发送的候选 JSON、模型原始响应、解析后的决策——无需额外工具即可审计。
 
 ```
 You are a code symbol mapping assistant.
-The identifier below is a non-standard (legacy) name that may correspond to one of the
-candidate mappings. Decide which candidate, if any, the identifier is a misspelling/
-abbreviation of, using the surrounding context.
+Match the identifier to the single best legacy token. Engineers abbreviate by
+dropping vowels and truncating words, e.g. "fndMkt" is "findMarket",
+"lstRsk" is "listRisk", "rcvAst" is "receiveAsset". Use the fuzzy scores as a
+hint, but trust your own judgement if a lower-scored token is a better fit.
+Always pick the closest match; only return null if the identifier is completely
+unrelated to every candidate.
 
-Return ONLY a JSON object. "key" MUST be copied verbatim from the left-hand "legacy"
-column of one candidate line below:
-  {"key": "<exact legacy token>", "confidence": <0.0-1.0>}
-If none fits, return {"key": null, "confidence": 0.0}
+Return ONLY a JSON object:
+  {"key": "<legacy_token value copied verbatim>", "confidence": <0.0-1.0>}
+or {"key": null, "confidence": 0.0} if truly no candidate fits.
 
 Identifier: {text}
 Type: {id_type}
-Context:
-{context}
 
-Candidates (legacy -> canonical):
-{candidates}
+Candidates:
+[{"legacy_token": "findMarket", "scores": {"ratio": 0.727, "partial_ratio": 0.8,
+  "token_sort_ratio": 0.727, "jaro_winkler": 0.874, "weighted": 0.762}}, ...]
 ```
 
-> 实测中 `llama3.1:8b` 常常回传 `canonical`（映射右侧）而非 `legacy` key。由于映射是 1对1 的，召回模块对两侧都接受，且严格限制在候选集合内，以此兼顾鲁棒性与可审计性。集合外的回答按拒绝处理。
+集合外的回答按拒绝处理，以保证可审计性。
 
 #### `llm.py` — LLM 客户端抽象
 
-封装统一的 `complete(prompt)` 接口。默认后端连接本地 **Ollama** 服务，其他后端可实现同一协议。
+封装统一的 `complete(prompt)` 接口，通过 `config.toml` 选择后端：
+
+| `backend` | 类 | API Key 环境变量 |
+| --- | --- | --- |
+| `"ollama"` | `OllamaClient` | — （本地服务） |
+| `"anthropic"` | `AnthropicClient` | `CLAUDE_API_KEY` 或 `ANTHROPIC_API_KEY` |
+| `"openai"` | `OpenAIClient` | `AGNES_API_KEY` 或 `OPENAI_API_KEY` |
+
+`"openai"` 后端兼容任何支持 `/v1/chat/completions` 的端点（通过 `base_url` 指定）。API Key 从环境变量读取，不可提交到代码仓库。
 
 ### 置信度分级
 
@@ -188,9 +214,11 @@ auto_apply = 0.99   # 直接应用，不经 LLM
 recall_min = 0.45   # 低于此值直接丢弃
 
 [llm]
-backend    = "ollama"
-base_url   = "http://localhost:11434"
-model      = "llama3.1:8b"
+# backend = "ollama"     base_url = "http://localhost:11434"  model = "llama3.1:8b"
+# backend = "openai"     base_url = "https://..."             model = "<model-id>"
+backend    = "anthropic"
+base_url   = "https://api.anthropic.com"
+model      = "claude-haiku-4-5-20251001"
 max_tokens = 64
 timeout    = 30.0
 cache      = true
@@ -236,7 +264,7 @@ symbol-aligner/
 │   ├── ast_analyze.py      # ASTAnalyzer：tree-sitter 解析与定位
 │   ├── fuzz_match.py       # get_top_k / score：模糊匹配打分
 │   ├── recall.py           # LLMRecall：低置信度召回
-│   ├── llm.py              # LLMClient 抽象（Ollama 后端）
+│   ├── llm.py              # LLMClient 抽象（Ollama / Anthropic / OpenAI 后端）
 │   ├── models.py           # IdentifierCandidate / MatchResult / AlignmentReport
 │   ├── mapping.py          # 映射表加载与校验
 │   ├── config.py           # config.toml 加载
@@ -293,11 +321,40 @@ python -m symbol_aligner.main path/to/file.py mappings/example.json --apply --us
 
 ### LLM 后端
 
-召回使用本地 [Ollama](https://ollama.com/)，默认模型 `llama3.1:8b`，配置见 `config.toml` 的 `[llm]`：
+支持三种后端，通过 `config.toml` 的 `[llm]` 配置：
 
+**Ollama（本地）**
 ```bash
 ollama pull llama3.1:8b   # 一次性
 ollama serve              # 默认监听 http://localhost:11434
+```
+```toml
+[llm]
+backend = "ollama"
+base_url = "http://localhost:11434"
+model = "llama3.1:8b"
+```
+
+**Anthropic**
+```bash
+export CLAUDE_API_KEY=sk-ant-...   # 或 ANTHROPIC_API_KEY
+```
+```toml
+[llm]
+backend = "anthropic"
+base_url = "https://api.anthropic.com"
+model = "claude-haiku-4-5-20251001"
+```
+
+**OpenAI 兼容**（任何支持 `/v1/chat/completions` 的端点）
+```bash
+export AGNES_API_KEY=...   # 或 OPENAI_API_KEY
+```
+```toml
+[llm]
+backend = "openai"
+base_url = "https://apihub.agnes-ai.com"
+model = "agnes-2.0-flash"
 ```
 
 未加 `--use-llm` 时完全不接触 LLM，落在召回区间的候选直接丢弃。
@@ -317,7 +374,7 @@ python -m symbol_aligner.mcp_server   # 或安装后的 symbol-aligner-mcp
 ### 测试
 
 ```bash
-pytest                 # 全部，含连不上 Ollama 时自动跳过的 live 用例
+pytest                 # 全部；未配置后端时 live 用例自动跳过
 pytest -m "not live"   # 跳过 live 用例
 ```
 
