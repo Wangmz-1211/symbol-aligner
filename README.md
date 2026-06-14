@@ -379,7 +379,7 @@ compares the result against ground truth. Test cases use real-world abbreviation
 | clean — exact legacy keys (auto-apply path) | 24 | **100%** (24/24) |
 | abbrev — fuzzy top-1, no LLM (`auto_apply=0`, `recall_min=0`) | 128 | **98.4%** (126/128) |
 | abbrev + LLM recall — `claude-haiku-4-5` | 128 | **100%** (128/128) |
-| abbrev + LLM recall — `llama3.1:8b` | 128 | **83.6%** (107/128) |
+| abbrev + LLM recall — `llama3.1:8b` | 128 | **100%** (128/128) |
 
 **Fuzzy top-1 alone resolves 98.4% of abbreviation cases without touching the LLM.** The
 remaining ~1.6% fall into the recall band where the identifier is ambiguous enough that
