@@ -16,23 +16,21 @@ from .llm import LLMClient
 from .models import IdentifierCandidate, MatchResult, MatchSource
 
 _PROMPT = """You are a code symbol mapping assistant.
-Match the identifier to the single best candidate. Engineers abbreviate by
+Match the identifier to the single best legacy token. Engineers abbreviate by
 dropping vowels and truncating words, e.g. "fndMkt" is "findMarket",
-"lstRsk" is "listRisk", "rcvAst" is "receiveAsset". Always pick the closest
-match; only return null if the identifier is completely unrelated to every
-candidate.
+"lstRsk" is "listRisk", "rcvAst" is "receiveAsset". Use the fuzzy scores as a
+hint, but trust your own judgement if a lower-scored token is a better fit.
+Always pick the closest match; only return null if the identifier is completely
+unrelated to every candidate.
 
 Return ONLY a JSON object:
-  {{"key": "<legacy token copied verbatim>", "confidence": <0.0-1.0>}}
+  {{"key": "<legacy_token value copied verbatim>", "confidence": <0.0-1.0>}}
 or {{"key": null, "confidence": 0.0}} if truly no candidate fits.
-"key" must be ONLY the token name on the left of "->", nothing else.
 
 Identifier: {text}
 Type: {id_type}
-Context:
-{context}
 
-Candidates (legacy_token -> canonical):
+Candidates:
 {candidates}
 """
 
@@ -44,6 +42,7 @@ class LLMRecall:
         self.client = client
         self.mapping = mapping
         self._cache: dict[tuple, MatchResult] | None = {} if cache else None
+        self.audit_log: list[dict] = []
 
     def __call__(
         self, candidate: IdentifierCandidate, top_k: list[tuple[str, float]]
@@ -52,7 +51,7 @@ class LLMRecall:
         return self.recall(candidate, top_k)
 
     def recall(
-        self, candidate: IdentifierCandidate, top_k: list[tuple[str, float]]
+        self, candidate: IdentifierCandidate, top_k: list[tuple[str, dict]]
     ) -> MatchResult:
         keys = tuple(k for k, _ in top_k)
         cache_key = (candidate.text, candidate.context, keys)
@@ -61,7 +60,8 @@ class LLMRecall:
             return MatchResult(candidate, cached.matched_key, cached.replacement,
                                cached.confidence, cached.source, cached.reason)
 
-        prompt = self._build_prompt(candidate, keys)
+        prompt = self._build_prompt(candidate, top_k)
+        raw = ""
         try:
             raw = self.client.complete(prompt)
             result = self._parse(candidate, raw, keys)
@@ -69,17 +69,27 @@ class LLMRecall:
             result = MatchResult(candidate, None, None, 0.0, MatchSource.NONE,
                                  f"LLM recall failed: {exc}")
 
+        self.audit_log.append({
+            "identifier": candidate.text,
+            "id_type": candidate.id_type.value,
+            "candidates": [{"legacy_token": k, "scores": d} for k, d in top_k],
+            "prompt": prompt,
+            "raw_response": raw,
+            "matched_key": result.matched_key,
+            "confidence": result.confidence,
+            "reason": result.reason,
+        })
+
         if self._cache is not None:
             self._cache[cache_key] = result
         return result
 
-    def _build_prompt(self, candidate: IdentifierCandidate, keys: tuple[str, ...]) -> str:
-        listing = "\n".join(f"- {k} -> {self.mapping[k]}" for k in keys)
+    def _build_prompt(self, candidate: IdentifierCandidate, top_k: list[tuple[str, dict]]) -> str:
+        entries = [{"legacy_token": k, "scores": detail} for k, detail in top_k]
         return _PROMPT.format(
             text=candidate.text,
             id_type=candidate.id_type.value,
-            context=candidate.context,
-            candidates=listing,
+            candidates=json.dumps(entries, ensure_ascii=False),
         )
 
     def _parse(

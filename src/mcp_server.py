@@ -94,8 +94,8 @@ def query_candidates(
         {
             "identifier": identifier,
             "top_k": [
-                {"legacy": k, "canonical": mapping[k], "score": round(s, 3)}
-                for k, s in top_k
+                {"legacy": k, "canonical": mapping[k], "scores": d}
+                for k, d in top_k
             ],
             "thresholds": {
                 "auto_apply": config.thresholds.auto_apply,

@@ -23,7 +23,7 @@ def test_query_candidates_tool():
     out = json.loads(mcp_server.query_candidates("getUser", "mappings/example.json"))
     assert out["identifier"] == "getUser"
     assert out["top_k"][0]["legacy"] == "getUser"
-    assert out["top_k"][0]["score"] == 1.0
+    assert out["top_k"][0]["scores"]["weighted"] == 1.0
 
 
 def test_preview_tool_does_not_write(tmp_path):
