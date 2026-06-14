@@ -129,41 +129,67 @@ def score(query, key, weights) -> float:
         + weights.jaro_winkler     * (JaroWinkler.similarity(query, key) * 100.0)  # 接頭辞の加重
     ) / 100.0
 
-def get_top_k(query, mapping, weights, k=3) -> list[tuple[str, float]]:
-    scored = [(key, score(query, key, weights)) for key in mapping]
-    scored.sort(key=lambda kv: (-kv[1], kv[0]))  # 同点は key 順。出力は安定
+def score_detail(query, key, weights) -> dict:
+    """4 つの分量スコアと最終加重スコアを返す。すべて [0, 1] の範囲。"""
+    if query == key:
+        return {"ratio": 1.0, "partial_ratio": 1.0,
+                "token_sort_ratio": 1.0, "jaro_winkler": 1.0, "weighted": 1.0}
+    ratio      = fuzz.ratio(query, key) / 100.0
+    partial    = fuzz.partial_ratio(query, key) / 100.0
+    token_sort = fuzz.token_sort_ratio(query, key) / 100.0
+    jw         = JaroWinkler.similarity(query, key)
+    weighted   = (weights.ratio * ratio + weights.partial_ratio * partial
+                  + weights.token_sort_ratio * token_sort + weights.jaro_winkler * jw)
+    return {"ratio": ratio, "partial_ratio": partial,
+            "token_sort_ratio": token_sort, "jaro_winkler": jw, "weighted": weighted}
+
+def get_top_k(query, mapping, weights, k=3) -> list[tuple[str, dict]]:
+    """加重スコアの高い順に最大 k 個の (legacy_key, score_detail) ペアを返す。"""
+    scored = [(key, score_detail(query, key, weights)) for key in mapping]
+    scored.sort(key=lambda kv: (-kv[1]["weighted"], kv[0]))
     return scored[:k]
 ```
 
 #### `recall.py` — LLM リコール（フォールバック）
 
-**top-1 スコアがリコール帯に入ったときのみ起動**し、パイプライン全体で LLM を呼ぶ唯一の箇所です。TopK 候補とコンテキストを LLM に渡し、提示した集合の中から**選ばせます**（置換を勝手に生成させません）。出力は厳密に制限された JSON で、トークン消費は最小限です。同じ `(text, context, 候補 keys)` の結果はキャッシュされます。
+**top-1 スコアがリコール帯に入ったときのみ起動**し、パイプライン全体で LLM を呼ぶ唯一の箇所です。top-k 候補（各アルゴリズムのスコア明細を含む）を JSON 配列として LLM に渡し、提示した集合の中から**選ばせます**（置換を勝手に生成させません）。出力は厳密に制限された JSON オブジェクトで、トークン消費は最小限です。同じ `(text, 候補 keys)` の結果はキャッシュされます。
+
+すべての呼び出しは `LLMRecall.audit_log` に記録されます。送信した候補 JSON・モデルの生の応答・解析後の決定という完全なチェーンが残るため、追加ツール不要で監査できます。
 
 ```
 You are a code symbol mapping assistant.
-The identifier below is a non-standard (legacy) name that may correspond to one of the
-candidate mappings. Decide which candidate, if any, the identifier is a misspelling/
-abbreviation of, using the surrounding context.
+Match the identifier to the single best legacy token. Engineers abbreviate by
+dropping vowels and truncating words, e.g. "fndMkt" is "findMarket",
+"lstRsk" is "listRisk", "rcvAst" is "receiveAsset". Use the fuzzy scores as a
+hint, but trust your own judgement if a lower-scored token is a better fit.
+Always pick the closest match; only return null if the identifier is completely
+unrelated to every candidate.
 
-Return ONLY a JSON object. "key" MUST be copied verbatim from the left-hand "legacy"
-column of one candidate line below:
-  {"key": "<exact legacy token>", "confidence": <0.0-1.0>}
-If none fits, return {"key": null, "confidence": 0.0}
+Return ONLY a JSON object:
+  {"key": "<legacy_token value copied verbatim>", "confidence": <0.0-1.0>}
+or {"key": null, "confidence": 0.0} if truly no candidate fits.
 
 Identifier: {text}
 Type: {id_type}
-Context:
-{context}
 
-Candidates (legacy -> canonical):
-{candidates}
+Candidates:
+[{"legacy_token": "findMarket", "scores": {"ratio": 0.727, "partial_ratio": 0.8,
+  "token_sort_ratio": 0.727, "jaro_winkler": 0.874, "weighted": 0.762}}, ...]
 ```
 
-> 実測では `llama3.1:8b` は `legacy` key ではなく `canonical`（右側）を返すことがよくあります。マッピングが 1 対 1 であるため、リコールモジュールはどちらの側も受け付けますが、提示した候補集合の内側に厳密に限定し、堅牢性と可監査性を両立させます。集合外の回答は拒否として扱います。
+集合外の回答は可監査性を保つため拒否として扱います。
 
 #### `llm.py` — LLM クライアント抽象
 
-最小限の `complete(prompt)` インターフェースをラップします。デフォルトのバックエンドはローカルの **Ollama** サーバーに接続し、他のバックエンドも同じプロトコルを実装できます。
+最小限の `complete(prompt)` インターフェースをラップします。`config.toml` でバックエンドを選択します。
+
+| `backend` | クラス | API Key 環境変数 |
+| --- | --- | --- |
+| `"ollama"` | `OllamaClient` | — （ローカルサーバー） |
+| `"anthropic"` | `AnthropicClient` | `CLAUDE_API_KEY` または `ANTHROPIC_API_KEY` |
+| `"openai"` | `OpenAIClient` | `AGNES_API_KEY` または `OPENAI_API_KEY` |
+
+`"openai"` バックエンドは `/v1/chat/completions` を話す任意のエンドポイントと互換性があります（`base_url` で指定）。API Key は環境変数から読み込まれ、リポジトリにコミットしてはなりません。
 
 ### 信頼度の分級
 
@@ -188,9 +214,11 @@ auto_apply = 0.99   # 直接適用、LLM を経由しない
 recall_min = 0.45   # これ未満は破棄
 
 [llm]
-backend    = "ollama"
-base_url   = "http://localhost:11434"
-model      = "llama3.1:8b"
+# backend = "ollama"     base_url = "http://localhost:11434"  model = "llama3.1:8b"
+# backend = "openai"     base_url = "https://..."             model = "<model-id>"
+backend    = "anthropic"
+base_url   = "https://api.anthropic.com"
+model      = "claude-haiku-4-5-20251001"
 max_tokens = 64
 timeout    = 30.0
 cache      = true
@@ -236,7 +264,7 @@ symbol-aligner/
 │   ├── ast_analyze.py      # ASTAnalyzer: tree-sitter による解析と位置特定
 │   ├── fuzz_match.py       # get_top_k / score: ファジースコアリング
 │   ├── recall.py           # LLMRecall: 低信頼度リコール
-│   ├── llm.py              # LLMClient 抽象（Ollama バックエンド）
+│   ├── llm.py              # LLMClient 抽象（Ollama / Anthropic / OpenAI バックエンド）
 │   ├── models.py           # IdentifierCandidate / MatchResult / AlignmentReport
 │   ├── mapping.py          # マッピング表の読み込みと検証
 │   ├── config.py           # config.toml の読み込み
@@ -293,11 +321,40 @@ python -m symbol_aligner.main path/to/file.py mappings/example.json --apply --us
 
 ### LLM バックエンド
 
-リコールはローカルの [Ollama](https://ollama.com/) サーバーを使い、デフォルトモデルは `llama3.1:8b`、設定は `config.toml` の `[llm]` にあります。
+3 つのバックエンドを利用できます。`config.toml` の `[llm]` で設定します。
 
+**Ollama（ローカル）**
 ```bash
 ollama pull llama3.1:8b   # 一度だけ
 ollama serve              # デフォルトで http://localhost:11434 を待ち受け
+```
+```toml
+[llm]
+backend = "ollama"
+base_url = "http://localhost:11434"
+model = "llama3.1:8b"
+```
+
+**Anthropic**
+```bash
+export CLAUDE_API_KEY=sk-ant-...   # または ANTHROPIC_API_KEY
+```
+```toml
+[llm]
+backend = "anthropic"
+base_url = "https://api.anthropic.com"
+model = "claude-haiku-4-5-20251001"
+```
+
+**OpenAI 互換**（`/v1/chat/completions` を話す任意のエンドポイント）
+```bash
+export AGNES_API_KEY=...   # または OPENAI_API_KEY
+```
+```toml
+[llm]
+backend = "openai"
+base_url = "https://apihub.agnes-ai.com"
+model = "agnes-2.0-flash"
 ```
 
 `--use-llm` を付けない場合、LLM には一切触れず、リコール帯の候補は破棄されます。
@@ -317,7 +374,7 @@ python -m symbol_aligner.mcp_server   # またはインストール済みの sym
 ### テスト
 
 ```bash
-pytest                 # 全部。Ollama に接続できない場合に自動スキップされる live テストを含む
+pytest                 # 全部。バックエンド未設定時は live テストが自動スキップ
 pytest -m "not live"   # live テストをスキップ
 ```
 
