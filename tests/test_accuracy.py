@@ -18,8 +18,10 @@ from __future__ import annotations
 import httpx
 import pytest
 
+import json
+
 from symbol_aligner.config import Config, Thresholds, load_config
-from symbol_aligner.main import align_file, align_source
+from symbol_aligner.main import align_file, align_source, build_recaller
 from symbol_aligner.mapping import load_mapping
 
 MAPPING_PATH = "mappings/example.json"
@@ -180,6 +182,9 @@ def _llm_available(cfg) -> bool:
     if cfg.llm.backend == "anthropic":
         import os
         return bool(os.environ.get("CLAUDE_API_KEY") or os.environ.get("ANTHROPIC_API_KEY"))
+    if cfg.llm.backend == "openai":
+        import os
+        return bool(os.environ.get("AGNES_API_KEY") or os.environ.get("OPENAI_API_KEY"))
     # ollama: probe the tags endpoint
     try:
         httpx.get(f"{cfg.llm.base_url.rstrip('/')}/api/tags", timeout=2.0).raise_for_status()
@@ -240,7 +245,11 @@ def test_accuracy_abbrev_fuzzy_top1(tmp_path, capsys):
 
 @pytest.mark.live
 def test_accuracy_abbrev_with_llm(tmp_path, capsys):
-    """128 abbreviated identifiers processed with real LLM recall."""
+    """128 abbreviated identifiers processed with real LLM recall.
+
+    Prints a full audit log — one entry per LLM call — showing the candidates
+    JSON sent, the raw model response, and the final decision.
+    """
     cfg = load_config()
     if not _llm_available(cfg):
         pytest.skip(f"LLM backend {cfg.llm.backend!r} not reachable / not configured")
@@ -250,25 +259,49 @@ def test_accuracy_abbrev_with_llm(tmp_path, capsys):
     src = tmp_path / "abbrev_llm.py"
     src.write_text(_build_source(tokens))
 
-    report = align_file(str(src), MAPPING_PATH, dry_run=True, use_llm=True)
-    correct, total, acc = _accuracy(report.results, ground_truth)
+    recaller = build_recaller(MAPPING, cfg)
+    results = align_source(src.read_bytes(), MAPPING, cfg, "python", str(src), recaller)
+    correct, total, acc = _accuracy(results, ground_truth)
 
     with capsys.disabled():
         print(
             f"\n[abbrev-llm] recall accuracy = {correct}/{total} = {acc:.1%}"
             f"  (model={cfg.llm.model})"
         )
-        errors = [
-            r for r in report.results
+
+        error_ids = {
+            r.candidate.text
+            for r in results
             if r.candidate.text in ground_truth
             and not (r.applied and r.replacement == ground_truth[r.candidate.text])
-        ]
-        if errors:
-            print(f"\n--- {len(errors)} errors ---")
-            for r in errors:
-                expected = ground_truth[r.candidate.text]
-                got = r.replacement if r.applied else "(not applied)"
-                print(f"  {r.candidate.text!r:20s}  expected={expected!r:30s}  got={got!r}  reason={r.reason}")
+        }
+
+        print(f"\n{'='*70}")
+        print(f"  FULL LLM AUDIT LOG  ({len(recaller.audit_log)} calls)")
+        print(f"{'='*70}")
+        for i, entry in enumerate(recaller.audit_log, 1):
+            ident = entry["identifier"]
+            is_error = ident in error_ids
+            status = "✗ ERROR" if is_error else "✓"
+            expected = ground_truth.get(ident, "?")
+            print(
+                f"\n[{i:3d}] {ident!r:20s}  matched={entry['matched_key']!r:30s}"
+                f"  conf={entry['confidence']:.2f}  {status}"
+            )
+            if is_error:
+                print(f"       expected={expected!r}")
+            print(f"       reason:    {entry['reason']}")
+            print(f"       candidates: {json.dumps(entry['candidates'], ensure_ascii=False)}")
+            print(f"       response:   {entry['raw_response']!r}")
+        print(f"\n{'='*70}")
+
+        if error_ids:
+            print(f"\n--- {len(error_ids)} errors ---")
+            for r in results:
+                if r.candidate.text in error_ids:
+                    expected = ground_truth[r.candidate.text]
+                    got = r.replacement if r.applied else "(not applied)"
+                    print(f"  {r.candidate.text!r:20s}  expected={expected!r:30s}  got={got!r}  reason={r.reason}")
 
     assert total == len(tokens)
     assert acc >= 0.0  # record result; LLM quality determines the floor

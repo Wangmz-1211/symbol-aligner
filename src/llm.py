@@ -66,10 +66,42 @@ class AnthropicClient:
         return msg.content[0].text if msg.content else ""
 
 
+class OpenAIClient:
+    """Calls any OpenAI-compatible /v1/chat/completions endpoint.
+
+    API key is read from AGNES_API_KEY, falling back to OPENAI_API_KEY.
+    """
+
+    def __init__(self, config: LLMConfig):
+        api_key = os.environ.get("AGNES_API_KEY") or os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            raise ValueError("AGNES_API_KEY or OPENAI_API_KEY environment variable is not set")
+        self._api_key = api_key
+        self.config = config
+
+    def complete(self, prompt: str) -> str:
+        payload = {
+            "model": self.config.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": self.config.max_tokens,
+            "temperature": 0.0,
+        }
+        resp = httpx.post(
+            f"{self.config.base_url.rstrip('/')}/v1/chat/completions",
+            json=payload,
+            headers={"Authorization": f"Bearer {self._api_key}"},
+            timeout=self.config.timeout,
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+
+
 def build_client(config: LLMConfig) -> LLMClient:
     """Instantiate the configured backend."""
     if config.backend == "ollama":
         return OllamaClient(config)
     if config.backend == "anthropic":
         return AnthropicClient(config)
+    if config.backend == "openai":
+        return OpenAIClient(config)
     raise ValueError(f"unsupported LLM backend: {config.backend!r}")

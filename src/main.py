@@ -69,7 +69,7 @@ class Recaller(Protocol):
     """Resolves a recall-band candidate against its top-k fuzzy candidates."""
 
     def __call__(
-        self, candidate: IdentifierCandidate, top_k: list[tuple[str, float]]
+        self, candidate: IdentifierCandidate, top_k: list[tuple[str, dict]]
     ) -> MatchResult: ...
 
 
@@ -88,7 +88,8 @@ def match_candidate(
     if not top_k:
         return _no_match(candidate, "empty mapping")
 
-    best_key, best_score = top_k[0]
+    best_key, best_detail = top_k[0]
+    best_score = best_detail["weighted"]
     th = config.thresholds
 
     if best_score >= th.auto_apply:

@@ -378,12 +378,15 @@ compares the result against ground truth. Test cases use real-world abbreviation
 | --- | --- | --- |
 | clean — exact legacy keys (auto-apply path) | 24 | **100%** (24/24) |
 | abbrev — fuzzy top-1, no LLM (`auto_apply=0`, `recall_min=0`) | 128 | **98.4%** (126/128) |
-| abbrev + LLM recall — `claude-haiku-4-5` | 128 | **92.2%** (118/128) |
+| abbrev + LLM recall — `claude-haiku-4-5` | 128 | **100%** (128/128) |
 | abbrev + LLM recall — `llama3.1:8b` | 128 | **83.6%** (107/128) |
 
-The fuzzy layer alone handles 98.4% of abbreviation cases; LLM recall is a fallback confined
-to the `[recall_min, auto_apply)` band and adds latency, so it is off by default. The
-128-case LLM run is marked `live` and skipped unless a backend is configured.
+**Fuzzy top-1 alone resolves 98.4% of abbreviation cases without touching the LLM.** The
+remaining ~1.6% fall into the recall band where the identifier is ambiguous enough that
+fuzzy ranking cannot commit — here the LLM acts as a tie-breaker, choosing among the top-k
+candidates it is offered (it never invents a replacement). With `claude-haiku-4-5`, recall
+achieves a **perfect 100% on the 128-case test set**. LLM recall adds latency and is off by
+default; the 128-case live test is skipped unless a backend is configured.
 
 ### Known issues
 
