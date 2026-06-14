@@ -62,7 +62,7 @@ and was split into two steps:
    prompt was provided so the Agent would make the edits following a predefined workflow
    and produce output in a predefined format.
 
-I suspect that reading the above already made you wince — perhaps even left you speechless.
+Looking back, several problems stand out.
 
 1. Clearly, the entire process was fixed: fixed sub-mappings, a fixed workflow, and a
    fixed output format. Yet none of this was ever distilled into a reusable Skill.
@@ -76,8 +76,8 @@ I suspect that reading the above already made you wince — perhaps even left yo
 
 The approach failed to recognize that an Agent is not a tool with a stable mapping, but
 an intelligent artifact built on top of a probabilistic model — which is exactly why it
-is called an *AI* Agent. In the end, practice proved this approach a thorough failure, and
-the files it produced left serious hidden risks for the later conversion and testing work.
+is called an *AI* Agent. In the end, practice showed this approach could not meet the accuracy requirements, and
+the files it produced left hidden risks for the later conversion and testing work.
 
 ### Attempt #2
 
