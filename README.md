@@ -137,59 +137,76 @@ score, covering spelling errors, dropped vowels, abbreviations, and other non-st
 naming. An exact match short-circuits to `1.0`.
 
 ```python
-def score(query, key, weights) -> float:
+def score_detail(query, key, weights) -> dict:
+    """Return all four component scores plus the final weighted score, all in [0, 1]."""
     if query == key:
-        return 1.0
-    return (
-        weights.ratio            * fuzz.ratio(query, key)             # Levenshtein: typos
-        + weights.partial_ratio    * fuzz.partial_ratio(query, key)   # substring: abbreviations
-        + weights.token_sort_ratio * fuzz.token_sort_ratio(query, key)  # order-insensitive
-        + weights.jaro_winkler     * (JaroWinkler.similarity(query, key) * 100.0)  # prefix weighting
-    ) / 100.0
+        return {"ratio": 1.0, "partial_ratio": 1.0,
+                "token_sort_ratio": 1.0, "jaro_winkler": 1.0, "weighted": 1.0}
+    ratio      = fuzz.ratio(query, key) / 100.0
+    partial    = fuzz.partial_ratio(query, key) / 100.0
+    token_sort = fuzz.token_sort_ratio(query, key) / 100.0
+    jw         = JaroWinkler.similarity(query, key)
+    weighted   = (weights.ratio * ratio + weights.partial_ratio * partial
+                  + weights.token_sort_ratio * token_sort + weights.jaro_winkler * jw)
+    return {"ratio": ratio, "partial_ratio": partial,
+            "token_sort_ratio": token_sort, "jaro_winkler": jw, "weighted": weighted}
 
-def get_top_k(query, mapping, weights, k=3) -> list[tuple[str, float]]:
-    scored = [(key, score(query, key, weights)) for key in mapping]
-    scored.sort(key=lambda kv: (-kv[1], kv[0]))  # ties broken by key, so output is stable
+def get_top_k(query, mapping, weights, k=3) -> list[tuple[str, dict]]:
+    """Return up to k (legacy_key, score_detail) pairs, highest weighted score first."""
+    scored = [(key, score_detail(query, key, weights)) for key in mapping]
+    scored.sort(key=lambda kv: (-kv[1]["weighted"], kv[0]))
     return scored[:k]
 ```
 
 #### `recall.py` — LLM recall (fallback)
 
 **Triggered only when the top-1 score lands in the recall band**; it is the one and only
-place in the whole pipeline that calls the LLM. The top-k candidates and the context are
-handed to the LLM, which **chooses** among the offered set (it does not invent a
-replacement); the output is tightly constrained JSON, so token usage is minimal. Results
-for the same `(text, context, candidate keys)` are cached.
+place in the whole pipeline that calls the LLM. The top-k candidates — each with their
+full per-algorithm score breakdown — are handed to the LLM as a JSON array. The LLM
+**chooses** among the offered set (it never invents a replacement); the output is a
+tightly constrained JSON object, keeping token usage minimal. Results are cached by
+`(text, candidate keys)`.
+
+Every call is recorded in `LLMRecall.audit_log` with the full chain: the candidates JSON
+sent, the raw model response, and the parsed decision — making the recall step fully
+auditable without additional tooling.
 
 ```
 You are a code symbol mapping assistant.
-The identifier below is a non-standard (legacy) name that may correspond to one of the
-candidate mappings. Decide which candidate, if any, the identifier is a misspelling/
-abbreviation of, using the surrounding context.
+Match the identifier to the single best legacy token. Engineers abbreviate by
+dropping vowels and truncating words, e.g. "fndMkt" is "findMarket",
+"lstRsk" is "listRisk", "rcvAst" is "receiveAsset". Use the fuzzy scores as a
+hint, but trust your own judgement if a lower-scored token is a better fit.
+Always pick the closest match; only return null if the identifier is completely
+unrelated to every candidate.
 
-Return ONLY a JSON object. "key" MUST be copied verbatim from the left-hand "legacy"
-column of one candidate line below:
-  {"key": "<exact legacy token>", "confidence": <0.0-1.0>}
-If none fits, return {"key": null, "confidence": 0.0}
+Return ONLY a JSON object:
+  {"key": "<legacy_token value copied verbatim>", "confidence": <0.0-1.0>}
+or {"key": null, "confidence": 0.0} if truly no candidate fits.
 
 Identifier: {text}
 Type: {id_type}
-Context:
-{context}
 
-Candidates (legacy -> canonical):
-{candidates}
+Candidates:
+[{"legacy_token": "findMarket", "scores": {"ratio": 0.727, "partial_ratio": 0.8,
+  "token_sort_ratio": 0.727, "jaro_winkler": 0.874, "weighted": 0.762}}, ...]
 ```
 
-> In practice `llama3.1:8b` often returns the `canonical` (right-hand side) instead of the
-> `legacy` key. Because the mapping is 1-to-1, the recall module accepts either side, while
-> still staying strictly within the offered candidate set — balancing robustness and
-> auditability. An out-of-set answer is treated as a rejection.
+An out-of-set answer is treated as a rejection to preserve auditability.
 
 #### `llm.py` — LLM client abstraction
 
-Wraps a minimal `complete(prompt)` interface. The default backend talks to a local
-**Ollama** server; other backends can implement the same protocol.
+Wraps a minimal `complete(prompt)` interface. Three backends are supported, selected via
+`config.toml`:
+
+| `backend` | Class | API key env var |
+| --- | --- | --- |
+| `"ollama"` | `OllamaClient` | — (local server) |
+| `"anthropic"` | `AnthropicClient` | `CLAUDE_API_KEY` or `ANTHROPIC_API_KEY` |
+| `"openai"` | `OpenAIClient` | `AGNES_API_KEY` or `OPENAI_API_KEY` |
+
+The `"openai"` backend is compatible with any OpenAI-format endpoint (set `base_url`
+accordingly). API keys are read from environment variables and must not be committed.
 
 ### Confidence grading
 
@@ -215,9 +232,11 @@ auto_apply = 0.99   # apply directly, no LLM
 recall_min = 0.45   # below this -> discard
 
 [llm]
-backend    = "ollama"
-base_url   = "http://localhost:11434"
-model      = "llama3.1:8b"
+# backend = "ollama"     base_url = "http://localhost:11434"  model = "llama3.1:8b"
+# backend = "openai"     base_url = "https://..."             model = "<model-id>"
+backend    = "anthropic"
+base_url   = "https://api.anthropic.com"
+model      = "claude-haiku-4-5-20251001"
 max_tokens = 64
 timeout    = 30.0
 cache      = true
@@ -263,7 +282,7 @@ symbol-aligner/
 │   ├── ast_analyze.py      # ASTAnalyzer: tree-sitter parsing & location
 │   ├── fuzz_match.py       # get_top_k / score: fuzzy scoring
 │   ├── recall.py           # LLMRecall: low-confidence recall
-│   ├── llm.py              # LLMClient abstraction (Ollama backend)
+│   ├── llm.py              # LLMClient abstraction (Ollama / Anthropic / OpenAI backends)
 │   ├── models.py           # IdentifierCandidate / MatchResult / AlignmentReport
 │   ├── mapping.py          # mapping table loading & validation
 │   ├── config.py           # config.toml loading
@@ -335,12 +354,40 @@ After install, the `symbol-aligner` console command is also available.
 
 ### LLM backend
 
-Recall uses a local [Ollama](https://ollama.com/) server, default model `llama3.1:8b`,
-configured under `[llm]` in `config.toml`:
+Three backends are available, configured under `[llm]` in `config.toml`:
 
+**Ollama (local)**
 ```bash
 ollama pull llama3.1:8b   # one-time
 ollama serve              # listens on http://localhost:11434 by default
+```
+```toml
+[llm]
+backend = "ollama"
+base_url = "http://localhost:11434"
+model = "llama3.1:8b"
+```
+
+**Anthropic**
+```bash
+export CLAUDE_API_KEY=sk-ant-...   # or ANTHROPIC_API_KEY
+```
+```toml
+[llm]
+backend = "anthropic"
+base_url = "https://api.anthropic.com"
+model = "claude-haiku-4-5-20251001"
+```
+
+**OpenAI-compatible** (any endpoint speaking `/v1/chat/completions`)
+```bash
+export AGNES_API_KEY=...   # or OPENAI_API_KEY
+```
+```toml
+[llm]
+backend = "openai"
+base_url = "https://apihub.agnes-ai.com"
+model = "agnes-2.0-flash"
 ```
 
 Without `--use-llm`, the LLM is never touched and recall-band candidates are discarded.
@@ -364,7 +411,7 @@ weights, must sum to 1).
 ### Testing
 
 ```bash
-pytest                 # everything, including live tests that auto-skip if Ollama is unreachable
+pytest                 # everything; live tests auto-skip if no backend is configured
 pytest -m "not live"   # skip the live tests
 ```
 
